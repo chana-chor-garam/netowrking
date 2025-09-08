@@ -3,20 +3,23 @@
 #include <string.h>
 #include <unistd.h>
 #include <math.h>
+#include <time.h>
 #include "headers.h"
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <arpa/inet.h>
+#include <sys/select.h>
 
-#define SERVER_IP "127.0.0.1"
-#define SERVER_PORT 8888
-#define BUFFER_SIZE sizeof(struct sham_header)
 #define PAYLOAD_SIZE 1024
-#define WINDOW_SIZE 4
+#define WINDOW_SIZE 4 // Max number of unacknowledged packets in flight
 
-// Updated RTO constants and variables
-#define ALPHA 0.125
-#define BETA 0.25
+// Global variables for packet loss simulation
+double packet_loss_rate = 0.0;
+int chat_mode = 0;
+
+// RTO constants and variables
+#define ALPHA 0.25
+#define BETA 0.75
 double EstimatedRTT = 500.0; // Initial RTT estimate in ms
 double DevRTT = 0.0;
 double RTO = 1000.0; // Initial RTO in ms
@@ -32,76 +35,145 @@ struct sent_packet {
 
 // Flow control state
 struct flow_control {
-    int last_byte_sent;      // Last byte sent
-    int last_byte_acked;     // Last byte acknowledged
-    int receiver_window;     // Receiver's advertised window size
-    int effective_window;    // min(congestion_window, receiver_window)
+    int last_byte_sent;
+    int last_byte_acked;
+    int receiver_window;
 };
 
-void send_data(int sockfd, struct sockaddr_in *server_addr, socklen_t server_len) {
+// Function declarations
+void send_termination_sequence(int sockfd, struct sockaddr_in *server_addr, socklen_t server_len, int next_seq_num);
+void send_data_chat(int sockfd, struct sockaddr_in *server_addr, socklen_t server_len);
+void send_data_file(int sockfd, struct sockaddr_in *server_addr, socklen_t server_len, const char* filename);
+void print_usage(const char* program_name);
+int should_drop_packet(void);
+
+// Simulate packet loss
+int should_drop_packet() {
+    if (packet_loss_rate <= 0.0) return 0;
+    double random_val = (double)rand() / RAND_MAX;
+    return random_val < packet_loss_rate;
+}
+
+void send_data_chat(int sockfd, struct sockaddr_in *server_addr, socklen_t server_len) {
     int next_seq_num = 1;
     int base_seq_num = 1;
     struct sent_packet window[WINDOW_SIZE];
     int window_start = 0;
     int window_count = 0;
     
-    // Initialize flow control
     struct flow_control fc;
     fc.last_byte_sent = 0;
     fc.last_byte_acked = 0;
-    fc.receiver_window = 1024; // Initial assumption, will be updated from ACKs
-    fc.effective_window = fc.receiver_window;
+    fc.receiver_window = 1024;
     
-    // Initialize window
     for (int i = 0; i < WINDOW_SIZE; i++) {
         window[i].is_valid = 0;
     }
     
-    printf("Enter data to send (type 'quit' to exit):\n");
+    printf("Enter chat messages (type '/quit' to exit):\n");
+    if (packet_loss_rate > 0.0) {
+        printf("Packet loss rate: %.2f%%\n", packet_loss_rate * 100);
+    }
     
     while (1) {
-        // Step 1: Fill the sliding window with new packets (respecting flow control)
-        while (window_count < WINDOW_SIZE) {
-            // Check flow control constraint: LastByteSent - LastByteAcked <= ReceiverWindow
-            int bytes_in_flight = fc.last_byte_sent - fc.last_byte_acked;
+        // Step 1: Check for incoming ACKs and timeouts
+        fd_set read_fds;
+        struct timeval tv, current_time;
+        
+        if (window_count > 0) {
+            gettimeofday(&current_time, NULL);
+            double elapsed = (current_time.tv_sec - window[window_start].sent_time.tv_sec) * 1000.0 +
+                             (current_time.tv_usec - window[window_start].sent_time.tv_usec) / 1000.0;
             
+            if (elapsed >= RTO) {
+                printf("TIMEOUT! Retransmitting SEQ=%u\n", window[window_start].seq_num);
+                ssize_t bytes_to_send = sizeof(struct sham_header) + window[window_start].data_length;
+                if (!should_drop_packet()) {
+                    sendto(sockfd, &window[window_start].packet, bytes_to_send, 0, (const struct sockaddr *)server_addr, server_len);
+                } else {
+                    printf("DROPPED retransmission SEQ=%u (simulated loss)\n", window[window_start].seq_num);
+                }
+                gettimeofday(&window[window_start].sent_time, NULL);
+                RTO *= 2;
+                if (RTO > 5000) RTO = 5000;
+                continue;
+            }
+            tv.tv_sec = (long)(RTO - elapsed) / 1000;
+            tv.tv_usec = ((long)(RTO - elapsed) % 1000) * 1000;
+        } else {
+            tv.tv_sec = 1;
+            tv.tv_usec = 0;
+        }
+        
+        FD_ZERO(&read_fds);
+        FD_SET(sockfd, &read_fds);
+        
+        int select_result = select(sockfd + 1, &read_fds, NULL, NULL, &tv);
+
+        if (select_result > 0) {
+            struct sham_header ack_header;
+            recvfrom(sockfd, &ack_header, sizeof(ack_header), 0, NULL, NULL);
+            
+            if (ack_header.flags & ACK) {
+                uint32_t ack_num = ntohl(ack_header.ack_num);
+                fc.receiver_window = ntohs(ack_header.window_size);
+                
+                printf("Received ACK=%u, Receiver Window=%d\n", ack_num, fc.receiver_window);
+                
+                // Update RTT/RTO only for non-retransmitted packets
+                if (window_count > 0 && window[window_start].is_valid) {
+                     gettimeofday(&current_time, NULL);
+                     double SampleRTT = (current_time.tv_sec - window[window_start].sent_time.tv_sec) * 1000.0 + 
+                                       (current_time.tv_usec - window[window_start].sent_time.tv_usec) / 1000.0;
+                     
+                     EstimatedRTT = (1 - ALPHA) * EstimatedRTT + ALPHA * SampleRTT;
+                     DevRTT = (1 - BETA) * DevRTT + BETA * fabs(SampleRTT - EstimatedRTT);
+                     RTO = EstimatedRTT + 4 * DevRTT;
+                     
+                     if (RTO < 100) RTO = 100;
+                     if (RTO > 5000) RTO = 5000;
+                }
+                
+                // Slide the window
+                while (window_count > 0 && (uint32_t)(window[window_start].seq_num + window[window_start].data_length) <= ack_num) {
+                    printf("Packet SEQ=%u acknowledged\n", window[window_start].seq_num);
+                    fc.last_byte_acked = window[window_start].seq_num + window[window_start].data_length - 1;
+                    window[window_start].is_valid = 0;
+                    window_start = (window_start + 1) % WINDOW_SIZE;
+                    window_count--;
+                }
+                
+                printf("Flow control update: Bytes in flight = %d, Receiver window = %d\n", fc.last_byte_sent - fc.last_byte_acked, fc.receiver_window);
+            }
+        } else if (select_result < 0) {
+            perror("select error");
+            break;
+        }
+
+        // Step 2: Read input and send new packets if the window has space
+        int bytes_in_flight = fc.last_byte_sent - fc.last_byte_acked;
+        while (window_count < WINDOW_SIZE && bytes_in_flight < fc.receiver_window) {
             char payload[PAYLOAD_SIZE];
-            printf("Input: ");
+            printf("You: ");
             fflush(stdout);
             
             if (fgets(payload, PAYLOAD_SIZE, stdin) == NULL) {
                 goto end_data_transfer;
             }
-            
-            if (strncmp(payload, "quit\n", 5) == 0) {
+            if (strcmp(payload, "/quit\n") == 0) {
                 goto end_data_transfer;
             }
             
-            // Process payload
             size_t payload_len = strlen(payload);
-            if (payload_len > 0 && payload[payload_len - 1] == '\n') {
-                payload[payload_len - 1] = '\0';
+            if (payload_len > 0 && payload[payload_len-1] == '\n') {
+                payload[payload_len-1] = '\0';
                 payload_len--;
             }
-
-            if (payload_len == 0) {
-                continue;
-            }
+            if (payload_len == 0) continue;
             
-            size_t packet_data_len = payload_len + 1; // +1 for null terminator
-            
-            // Check if sending this packet would violate flow control
-            if (bytes_in_flight + (int)packet_data_len > fc.receiver_window) {
-                printf("Flow control: Cannot send packet (would exceed receiver window)\n");
-                printf("  Bytes in flight: %d, Packet size: %zu, Receiver window: %d\n", 
-                       bytes_in_flight, packet_data_len, fc.receiver_window);
-                break; // Can't send more packets right now
-            }
-            
-            // Find next available slot in circular buffer
+            size_t packet_data_len = payload_len + 1;
             int slot = (window_start + window_count) % WINDOW_SIZE;
             
-            // Create and store the packet
             memset(&window[slot], 0, sizeof(struct sent_packet));
             window[slot].is_valid = 1;
             window[slot].seq_num = next_seq_num;
@@ -115,159 +187,178 @@ void send_data(int sockfd, struct sockaddr_in *server_addr, socklen_t server_len
             memcpy(window[slot].packet.payload, payload, payload_len);
             window[slot].packet.payload[payload_len] = '\0';
             
-            // Send the packet
             ssize_t bytes_to_send = sizeof(struct sham_header) + packet_data_len;
-            sendto(sockfd, &window[slot].packet, bytes_to_send, 0, 
-                   (const struct sockaddr *)server_addr, server_len);
-            gettimeofday(&window[slot].sent_time, NULL);
+            if (!should_drop_packet()) {
+                sendto(sockfd, &window[slot].packet, bytes_to_send, 0, (const struct sockaddr *)server_addr, server_len);
+                gettimeofday(&window[slot].sent_time, NULL);
+                printf("SND DATA SEQ=%u, Bytes in flight: %d, Receiver window: %d\n", next_seq_num, bytes_in_flight + (int)packet_data_len, fc.receiver_window);
+            } else {
+                printf("DROPPED packet SEQ=%u (simulated loss)\n", next_seq_num);
+                gettimeofday(&window[slot].sent_time, NULL);
+            }
             
-            // Update flow control
             fc.last_byte_sent = next_seq_num + packet_data_len - 1;
-            
-            printf("SND DATA SEQ=%u, Bytes in flight: %d, Receiver window: %d\n", 
-                   next_seq_num, fc.last_byte_sent - fc.last_byte_acked, fc.receiver_window);
-            
             next_seq_num += packet_data_len;
             window_count++;
+            bytes_in_flight = fc.last_byte_sent - fc.last_byte_acked;
         }
         
-        if (window_count == 0) {
-            break; // No more packets to send or wait for
+        if (window_count == 0 && next_seq_num > 1) {
+            break; // All data sent and acknowledged
         }
-        
-        // Step 2: Wait for ACKs or handle timeout
+    }
+    
+end_data_transfer:
+    send_termination_sequence(sockfd, server_addr, server_len, next_seq_num);
+}
+
+void send_data_file(int sockfd, struct sockaddr_in *server_addr, socklen_t server_len, const char* filename) {
+    FILE *input_file = fopen(filename, "rb");
+    if (!input_file) {
+        perror("Failed to open input file");
+        return;
+    }
+    
+    int next_seq_num = 1;
+    struct sent_packet window[WINDOW_SIZE];
+    int window_start = 0;
+    int window_count = 0;
+    int file_finished = 0;
+    
+    struct flow_control fc;
+    fc.last_byte_sent = 0;
+    fc.last_byte_acked = 0;
+    fc.receiver_window = 1024;
+    
+    for (int i = 0; i < WINDOW_SIZE; i++) {
+        window[i].is_valid = 0;
+    }
+    
+    printf("Starting file transfer: %s\n", filename);
+    if (packet_loss_rate > 0.0) {
+        printf("Packet loss rate: %.2f%%\n", packet_loss_rate * 100);
+    }
+    
+    while (!file_finished || window_count > 0) {
         fd_set read_fds;
         struct timeval tv, current_time;
         
-        // Calculate timeout for the oldest unacknowledged packet
-        gettimeofday(&current_time, NULL);
-        
-        if (!window[window_start].is_valid) {
-            continue;
+        if (window_count > 0) {
+            gettimeofday(&current_time, NULL);
+            double elapsed = (current_time.tv_sec - window[window_start].sent_time.tv_sec) * 1000.0 +
+                             (current_time.tv_usec - window[window_start].sent_time.tv_usec) / 1000.0;
+            
+            if (elapsed >= RTO) {
+                printf("TIMEOUT! Retransmitting SEQ=%u\n", window[window_start].seq_num);
+                ssize_t bytes_to_send = sizeof(struct sham_header) + window[window_start].data_length;
+                if (!should_drop_packet()) {
+                    sendto(sockfd, &window[window_start].packet, bytes_to_send, 0, (const struct sockaddr *)server_addr, server_len);
+                } else {
+                    printf("DROPPED retransmission SEQ=%u (simulated loss)\n", window[window_start].seq_num);
+                }
+                gettimeofday(&window[window_start].sent_time, NULL);
+                RTO *= 2;
+                if (RTO > 5000) RTO = 5000;
+                continue;
+            }
+            tv.tv_sec = (long)(RTO - elapsed) / 1000;
+            tv.tv_usec = ((long)(RTO - elapsed) % 1000) * 1000;
+        } else {
+            tv.tv_sec = 1;
+            tv.tv_usec = 0;
         }
         
-        double elapsed = (current_time.tv_sec - window[window_start].sent_time.tv_sec) * 1000.0 + 
-                        (current_time.tv_usec - window[window_start].sent_time.tv_usec) / 1000.0;
-        double remaining_time = RTO - elapsed;
-        
-        if (remaining_time <= 0) {
-            // Timeout - retransmit the oldest unacknowledged packet
-            printf("TIMEOUT! Retransmitting SEQ=%u\n", window[window_start].seq_num);
-            
-            ssize_t bytes_to_send = sizeof(struct sham_header) + window[window_start].data_length;
-            sendto(sockfd, &window[window_start].packet, bytes_to_send, 0, 
-                   (const struct sockaddr *)server_addr, server_len);
-            gettimeofday(&window[window_start].sent_time, NULL);
-            
-            // Double the RTO (exponential backoff)
-            RTO *= 2;
-            if (RTO > 5000) RTO = 5000; // Cap at 5 seconds
-            
-            continue;
-        }
-
-        // Set up select with remaining timeout
-        tv.tv_sec = (long)remaining_time / 1000;
-        tv.tv_usec = ((long)remaining_time % 1000) * 1000;
-
         FD_ZERO(&read_fds);
         FD_SET(sockfd, &read_fds);
-
+        
         int select_result = select(sockfd + 1, &read_fds, NULL, NULL, &tv);
 
         if (select_result > 0) {
-            // ACK received
             struct sham_header ack_header;
             recvfrom(sockfd, &ack_header, sizeof(ack_header), 0, NULL, NULL);
             
             if (ack_header.flags & ACK) {
                 uint32_t ack_num = ntohl(ack_header.ack_num);
-                uint16_t new_window = ntohs(ack_header.window_size);
-                
-                // Update flow control with receiver's advertised window
-                fc.receiver_window = new_window;
+                fc.receiver_window = ntohs(ack_header.window_size);
                 
                 printf("Received ACK=%u, Receiver Window=%d\n", ack_num, fc.receiver_window);
                 
-                // Check for zero window
-                if (fc.receiver_window == 0) {
-                    printf("Warning: Receiver window is zero - flow control will block sending\n");
+                if (window_count > 0 && window[window_start].is_valid) {
+                     gettimeofday(&current_time, NULL);
+                     double SampleRTT = (current_time.tv_sec - window[window_start].sent_time.tv_sec) * 1000.0 + 
+                                       (current_time.tv_usec - window[window_start].sent_time.tv_usec) / 1000.0;
+                     
+                     EstimatedRTT = (1 - ALPHA) * EstimatedRTT + ALPHA * SampleRTT;
+                     DevRTT = (1 - BETA) * DevRTT + BETA * fabs(SampleRTT - EstimatedRTT);
+                     RTO = EstimatedRTT + 4 * DevRTT;
+                     
+                     if (RTO < 100) RTO = 100;
+                     if (RTO > 5000) RTO = 5000;
                 }
                 
-                // Update RTT estimation
-                gettimeofday(&current_time, NULL);
-                double SampleRTT = (current_time.tv_sec - window[window_start].sent_time.tv_sec) * 1000.0 + 
-                                  (current_time.tv_usec - window[window_start].sent_time.tv_usec) / 1000.0;
-                
-                EstimatedRTT = (1 - ALPHA) * EstimatedRTT + ALPHA * SampleRTT;
-                DevRTT = (1 - BETA) * DevRTT + BETA * fabs(SampleRTT - EstimatedRTT);
-                RTO = EstimatedRTT + 4 * DevRTT;
-                
-                if (RTO < 100) RTO = 100; // Minimum RTO
-                if (RTO > 5000) RTO = 5000; // Maximum RTO
-                
-                // Handle cumulative ACK - slide the window
-                while (window_count > 0 && window[window_start].is_valid && 
-                       (uint32_t)(window[window_start].seq_num + window[window_start].data_length) <= ack_num) {
-                    
+                while (window_count > 0 && (uint32_t)(window[window_start].seq_num + window[window_start].data_length) <= ack_num) {
                     printf("Packet SEQ=%u acknowledged\n", window[window_start].seq_num);
-                    
-                    // Update flow control
                     fc.last_byte_acked = window[window_start].seq_num + window[window_start].data_length - 1;
-                    
                     window[window_start].is_valid = 0;
                     window_start = (window_start + 1) % WINDOW_SIZE;
                     window_count--;
-                    base_seq_num = ack_num;
                 }
                 
-                printf("Flow control update: Bytes in flight = %d, Receiver window = %d\n", 
-                       fc.last_byte_sent - fc.last_byte_acked, fc.receiver_window);
+                printf("Flow control update: Bytes in flight = %d, Receiver window = %d\n", fc.last_byte_sent - fc.last_byte_acked, fc.receiver_window);
             }
-        } else if (select_result == 0) {
-            // Timeout occurred, will be handled in next iteration
-            continue;
-        } else {
+        } else if (select_result < 0) {
             perror("select error");
             break;
         }
-    }
-    
-end_data_transfer:
-    // Wait for any remaining ACKs
-    while (window_count > 0) {
-        struct sham_header ack_header;
-        struct timeval timeout = {1, 0}; // 1 second timeout
-        
-        fd_set read_fds;
-        FD_ZERO(&read_fds);
-        FD_SET(sockfd, &read_fds);
-        
-        if (select(sockfd + 1, &read_fds, NULL, NULL, &timeout) > 0) {
-            recvfrom(sockfd, &ack_header, sizeof(ack_header), 0, NULL, NULL);
-            if (ack_header.flags & ACK) {
-                uint32_t ack_num = ntohl(ack_header.ack_num);
-                uint16_t new_window = ntohs(ack_header.window_size);
-                fc.receiver_window = new_window;
-                
-                printf("Final ACK received: %u, Window: %d\n", ack_num, fc.receiver_window);
-                
-                // Slide window for final ACKs
-                while (window_count > 0 && window[window_start].is_valid && 
-                       (uint32_t)(window[window_start].seq_num + window[window_start].data_length) <= ack_num) {
-                    
-                    fc.last_byte_acked = window[window_start].seq_num + window[window_start].data_length - 1;
-                    window[window_start].is_valid = 0;
-                    window_start = (window_start + 1) % WINDOW_SIZE;
-                    window_count--;
-                }
+
+        int bytes_in_flight = fc.last_byte_sent - fc.last_byte_acked;
+        while (window_count < WINDOW_SIZE && !file_finished && bytes_in_flight < fc.receiver_window) {
+            char payload[PAYLOAD_SIZE];
+            size_t bytes_read = fread(payload, 1, PAYLOAD_SIZE, input_file);
+            
+            if (bytes_read == 0) {
+                file_finished = 1;
+                break;
             }
-        } else {
-            break; // Timeout waiting for final ACKs
+            
+            size_t packet_data_len = bytes_read;
+            int slot = (window_start + window_count) % WINDOW_SIZE;
+            
+            memset(&window[slot], 0, sizeof(struct sent_packet));
+            window[slot].is_valid = 1;
+            window[slot].seq_num = next_seq_num;
+            window[slot].data_length = packet_data_len;
+            
+            window[slot].packet.header.flags = 0;
+            window[slot].packet.header.seq_num = htonl(next_seq_num);
+            window[slot].packet.header.ack_num = htonl(0);
+            window[slot].packet.header.window_size = htons(1024);
+            
+            memcpy(window[slot].packet.payload, payload, bytes_read);
+            
+            ssize_t bytes_to_send = sizeof(struct sham_header) + bytes_read;
+            if (!should_drop_packet()) {
+                sendto(sockfd, &window[slot].packet, bytes_to_send, 0, (const struct sockaddr *)server_addr, server_len);
+                gettimeofday(&window[slot].sent_time, NULL);
+                printf("SND DATA SEQ=%u, Size=%zu, Bytes in flight: %d, Receiver window: %d\n", next_seq_num, bytes_read, bytes_in_flight + (int)bytes_read, fc.receiver_window);
+            } else {
+                printf("DROPPED packet SEQ=%u (simulated loss)\n", next_seq_num);
+                gettimeofday(&window[slot].sent_time, NULL);
+            }
+            
+            fc.last_byte_sent = next_seq_num + bytes_read - 1;
+            next_seq_num += bytes_read;
+            window_count++;
+            bytes_in_flight = fc.last_byte_sent - fc.last_byte_acked;
         }
     }
     
-    // --- Termination logic starts here ---
+    fclose(input_file);
+    printf("File transfer complete.\n");
+    send_termination_sequence(sockfd, server_addr, server_len, next_seq_num);
+}
+
+void send_termination_sequence(int sockfd, struct sockaddr_in *server_addr, socklen_t server_len, int next_seq_num) {
     printf("Sending FIN to server...\n");
     struct sham_header fin_header;
     memset(&fin_header, 0, sizeof(fin_header));
@@ -277,39 +368,117 @@ end_data_transfer:
     fin_header.ack_num = htonl(0);
     fin_header.window_size = htons(1024);
     
-    sendto(sockfd, &fin_header, sizeof(fin_header), 0, (const struct sockaddr *)server_addr, server_len);
+    if (!should_drop_packet()) {
+        sendto(sockfd, &fin_header, sizeof(fin_header), 0, (const struct sockaddr *)server_addr, server_len);
+    } else {
+        printf("DROPPED FIN (simulated loss)\n");
+    }
 
-    // Wait for ACK and FIN from server
     struct sham_header header;
     socklen_t temp_len = server_len;
     
-    // Wait for server's ACK
-    recvfrom(sockfd, &header, sizeof(header), 0, (struct sockaddr *)server_addr, &temp_len);
-    if (header.flags & ACK) {
-        printf("Received ACK from server. Waiting for their FIN.\n");
-
-        // Wait for server's FIN
-        recvfrom(sockfd, &header, sizeof(header), 0, (struct sockaddr *)server_addr, &temp_len);
-        if (header.flags & FIN) {
-            printf("Received FIN from server. Sending final ACK.\n");
-
-            // Send final ACK
-            struct sham_header final_ack_header;
-            memset(&final_ack_header, 0, sizeof(final_ack_header));
-            
-            final_ack_header.flags = ACK;
-            final_ack_header.seq_num = htonl(ntohl(header.ack_num));
-            final_ack_header.ack_num = htonl(ntohl(header.seq_num) + 1);
-            final_ack_header.window_size = htons(1024);
-            
-            sendto(sockfd, &final_ack_header, sizeof(final_ack_header), 0, 
-                   (const struct sockaddr *)server_addr, server_len);
-            printf("Connection closed.\n");
+    // Unified loop to handle both ACK to FIN and server's FIN
+    int retries = 0;
+    while (retries < 5) {
+        struct timeval tv = {1, 0};
+        fd_set read_fds;
+        FD_ZERO(&read_fds);
+        FD_SET(sockfd, &read_fds);
+        
+        int select_result = select(sockfd + 1, &read_fds, NULL, NULL, &tv);
+        if (select_result > 0) {
+            recvfrom(sockfd, &header, sizeof(header), 0, (struct sockaddr *)server_addr, &temp_len);
+            if (header.flags & ACK && header.flags & FIN) {
+                printf("Received FIN-ACK from server. Sending final ACK.\n");
+                goto send_final_ack;
+            } else if (header.flags & ACK) {
+                printf("Received ACK from server. Waiting for their FIN.\n");
+            } else if (header.flags & FIN) {
+                printf("Received FIN from server. Sending final ACK.\n");
+                goto send_final_ack;
+            }
+        } else {
+            printf("Timeout waiting for server response. Re-transmitting FIN...\n");
+            if (!should_drop_packet()) {
+                sendto(sockfd, &fin_header, sizeof(fin_header), 0, (const struct sockaddr *)server_addr, server_len);
+            }
+            retries++;
         }
+    }
+
+    printf("Failed to close connection gracefully after multiple retries.\n");
+    return;
+    
+send_final_ack:;
+    struct sham_header final_ack_header;
+    memset(&final_ack_header, 0, sizeof(final_ack_header));
+    
+    final_ack_header.flags = ACK;
+    final_ack_header.seq_num = htonl(ntohl(header.ack_num));
+    final_ack_header.ack_num = htonl(ntohl(header.seq_num) + 1);
+    final_ack_header.window_size = htons(1024);
+    
+    if (!should_drop_packet()) {
+        sendto(sockfd, &final_ack_header, sizeof(final_ack_header), 0, (const struct sockaddr *)server_addr, server_len);
+        printf("Connection closed.\n");
+    } else {
+        printf("DROPPED final ACK (simulated loss)\n");
     }
 }
 
-int main() {
+void print_usage(const char* program_name) {
+    printf("Usage:\n");
+    printf("  File Transfer Mode: %s <server_ip> <server_port> <input_file> <output_file_name> [loss_rate]\n", program_name);
+    printf("  Chat Mode: %s <server_ip> <server_port> --chat [loss_rate]\n", program_name);
+    printf("  loss_rate: Packet loss probability 0.0-1.0 (optional, default: 0.0)\n");
+}
+
+int main(int argc, char *argv[]) {
+    if (argc < 3) {
+        print_usage(argv[0]);
+        return 1;
+    }
+    
+    char *server_ip = argv[1];
+    int server_port = atoi(argv[2]);
+    if (server_port <= 0) {
+        printf("Error: Invalid port number\n");
+        return 1;
+    }
+    
+    char *input_file = NULL;
+    char *output_file = NULL;
+    
+    if (argc >= 4 && strcmp(argv[3], "--chat") == 0) {
+        chat_mode = 1;
+        if (argc >= 5) {
+            double loss_rate = atof(argv[4]);
+            if (loss_rate >= 0.0 && loss_rate <= 1.0) {
+                packet_loss_rate = loss_rate;
+            } else {
+                printf("Warning: Invalid loss rate %s, using default 0.0\n", argv[4]);
+            }
+        }
+    } else {
+        if (argc < 5) {
+            print_usage(argv[0]);
+            return 1;
+        }
+        input_file = argv[3];
+        output_file = argv[4];
+        
+        if (argc >= 6) {
+            double loss_rate = atof(argv[5]);
+            if (loss_rate >= 0.0 && loss_rate <= 1.0) {
+                packet_loss_rate = loss_rate;
+            } else {
+                printf("Warning: Invalid loss rate %s, using default 0.0\n", argv[5]);
+            }
+        }
+    }
+    
+    srand(time(NULL));
+    
     int sockfd;
     struct sockaddr_in server_addr;
     socklen_t server_len = sizeof(server_addr);
@@ -322,8 +491,21 @@ int main() {
 
     memset(&server_addr, 0, sizeof(server_addr));
     server_addr.sin_family = AF_INET;
-    server_addr.sin_port = htons(SERVER_PORT);
-    inet_pton(AF_INET, SERVER_IP, &server_addr.sin_addr);
+    server_addr.sin_port = htons(server_port);
+    if (inet_pton(AF_INET, server_ip, &server_addr.sin_addr) <= 0) {
+        printf("Error: Invalid server IP address\n");
+        return 1;
+    }
+
+    printf("Connecting to server %s:%d\n", server_ip, server_port);
+    printf("Mode: %s\n", chat_mode ? "Chat" : "File Transfer");
+    if (!chat_mode) {
+        printf("Input file: %s\n", input_file);
+        printf("Output file: %s\n", output_file);
+    }
+    if (packet_loss_rate > 0.0) {
+        printf("Packet loss rate: %.2f%%\n", packet_loss_rate * 100);
+    }
 
     // Connection establishment
     memset(&header, 0, sizeof(header));
@@ -332,26 +514,42 @@ int main() {
     header.ack_num = htonl(0);
     header.window_size = htons(1024);
     
-    sendto(sockfd, &header, sizeof(header), 0, (const struct sockaddr *)&server_addr, server_len);
-    printf("Sent SYN with seq_num: %u\n", ntohl(header.seq_num));
+    if (!should_drop_packet()) {
+        sendto(sockfd, &header, sizeof(header), 0, (const struct sockaddr *)&server_addr, server_len);
+        printf("Sent SYN with seq_num: %u\n", ntohl(header.seq_num));
+    } else {
+        printf("DROPPED SYN (simulated loss)\n");
+    }
 
-    recvfrom(sockfd, &header, BUFFER_SIZE, 0, (struct sockaddr *)&server_addr, &server_len);
+    struct timeval handshake_timeout = {3, 0}; // 3-second timeout for handshake
+    fd_set read_fds;
+    FD_ZERO(&read_fds);
+    FD_SET(sockfd, &read_fds);
+    
+    if (select(sockfd + 1, &read_fds, NULL, NULL, &handshake_timeout) <= 0) {
+        printf("Handshake failed: Timeout waiting for SYN-ACK.\n");
+        close(sockfd);
+        return 1;
+    }
+    
+    recvfrom(sockfd, &header, sizeof(header), 0, (struct sockaddr *)&server_addr, &server_len);
     if ((header.flags & SYN) && (header.flags & ACK)) {
         uint16_t initial_window = ntohs(header.window_size);
-        printf("Received SYN-ACK with seq_num: %u, ack_num: %u, window: %d\n", 
-               ntohl(header.seq_num), ntohl(header.ack_num), initial_window);
+        printf("Received SYN-ACK with seq_num: %u, ack_num: %u, window: %d\n", ntohl(header.seq_num), ntohl(header.ack_num), initial_window);
 
         struct sham_header final_ack_header;
         memset(&final_ack_header, 0, sizeof(final_ack_header));
-        
         final_ack_header.flags = ACK;
         final_ack_header.seq_num = htonl(ntohl(header.ack_num));
         final_ack_header.ack_num = htonl(ntohl(header.seq_num) + 1);
         final_ack_header.window_size = htons(1024);
 
-        sendto(sockfd, &final_ack_header, sizeof(final_ack_header), 0, 
-               (const struct sockaddr *)&server_addr, server_len);
-        printf("Sent final ACK. Handshake complete.\n");
+        if (!should_drop_packet()) {
+            sendto(sockfd, &final_ack_header, sizeof(final_ack_header), 0, (const struct sockaddr *)&server_addr, server_len);
+            printf("Sent final ACK. Handshake complete.\n");
+        } else {
+            printf("DROPPED final handshake ACK (simulated loss)\n");
+        }
     } else {
         printf("Handshake failed.\n");
         close(sockfd);
@@ -359,7 +557,11 @@ int main() {
     }
 
     printf("Handshake complete. Starting data transfer.\n");
-    send_data(sockfd, &server_addr, server_len);
+    if (chat_mode) {
+        send_data_chat(sockfd, &server_addr, server_len);
+    } else {
+        send_data_file(sockfd, &server_addr, server_len, input_file);
+    }
     
     close(sockfd);
     return 0;
