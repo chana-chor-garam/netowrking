@@ -30,12 +30,27 @@ struct sent_packet {
     size_t data_length;
 };
 
+// Flow control state
+struct flow_control {
+    int last_byte_sent;      // Last byte sent
+    int last_byte_acked;     // Last byte acknowledged
+    int receiver_window;     // Receiver's advertised window size
+    int effective_window;    // min(congestion_window, receiver_window)
+};
+
 void send_data(int sockfd, struct sockaddr_in *server_addr, socklen_t server_len) {
     int next_seq_num = 1;
     int base_seq_num = 1;
     struct sent_packet window[WINDOW_SIZE];
     int window_start = 0;
     int window_count = 0;
+    
+    // Initialize flow control
+    struct flow_control fc;
+    fc.last_byte_sent = 0;
+    fc.last_byte_acked = 0;
+    fc.receiver_window = 1024; // Initial assumption, will be updated from ACKs
+    fc.effective_window = fc.receiver_window;
     
     // Initialize window
     for (int i = 0; i < WINDOW_SIZE; i++) {
@@ -45,8 +60,11 @@ void send_data(int sockfd, struct sockaddr_in *server_addr, socklen_t server_len
     printf("Enter data to send (type 'quit' to exit):\n");
     
     while (1) {
-        // Step 1: Fill the sliding window with new packets
+        // Step 1: Fill the sliding window with new packets (respecting flow control)
         while (window_count < WINDOW_SIZE) {
+            // Check flow control constraint: LastByteSent - LastByteAcked <= ReceiverWindow
+            int bytes_in_flight = fc.last_byte_sent - fc.last_byte_acked;
+            
             char payload[PAYLOAD_SIZE];
             printf("Input: ");
             fflush(stdout);
@@ -70,6 +88,16 @@ void send_data(int sockfd, struct sockaddr_in *server_addr, socklen_t server_len
                 continue;
             }
             
+            size_t packet_data_len = payload_len + 1; // +1 for null terminator
+            
+            // Check if sending this packet would violate flow control
+            if (bytes_in_flight + (int)packet_data_len > fc.receiver_window) {
+                printf("Flow control: Cannot send packet (would exceed receiver window)\n");
+                printf("  Bytes in flight: %d, Packet size: %zu, Receiver window: %d\n", 
+                       bytes_in_flight, packet_data_len, fc.receiver_window);
+                break; // Can't send more packets right now
+            }
+            
             // Find next available slot in circular buffer
             int slot = (window_start + window_count) % WINDOW_SIZE;
             
@@ -77,7 +105,7 @@ void send_data(int sockfd, struct sockaddr_in *server_addr, socklen_t server_len
             memset(&window[slot], 0, sizeof(struct sent_packet));
             window[slot].is_valid = 1;
             window[slot].seq_num = next_seq_num;
-            window[slot].data_length = payload_len + 1; // +1 for null terminator
+            window[slot].data_length = packet_data_len;
             
             window[slot].packet.header.flags = 0;
             window[slot].packet.header.seq_num = htonl(next_seq_num);
@@ -88,14 +116,18 @@ void send_data(int sockfd, struct sockaddr_in *server_addr, socklen_t server_len
             window[slot].packet.payload[payload_len] = '\0';
             
             // Send the packet
-            ssize_t bytes_to_send = sizeof(struct sham_header) + payload_len + 1;
+            ssize_t bytes_to_send = sizeof(struct sham_header) + packet_data_len;
             sendto(sockfd, &window[slot].packet, bytes_to_send, 0, 
                    (const struct sockaddr *)server_addr, server_len);
             gettimeofday(&window[slot].sent_time, NULL);
             
-            printf("SND DATA SEQ=%u\n", next_seq_num);
+            // Update flow control
+            fc.last_byte_sent = next_seq_num + packet_data_len - 1;
             
-            next_seq_num += (payload_len + 1);
+            printf("SND DATA SEQ=%u, Bytes in flight: %d, Receiver window: %d\n", 
+                   next_seq_num, fc.last_byte_sent - fc.last_byte_acked, fc.receiver_window);
+            
+            next_seq_num += packet_data_len;
             window_count++;
         }
         
@@ -150,7 +182,17 @@ void send_data(int sockfd, struct sockaddr_in *server_addr, socklen_t server_len
             
             if (ack_header.flags & ACK) {
                 uint32_t ack_num = ntohl(ack_header.ack_num);
-                printf("Received ACK=%u\n", ack_num);
+                uint16_t new_window = ntohs(ack_header.window_size);
+                
+                // Update flow control with receiver's advertised window
+                fc.receiver_window = new_window;
+                
+                printf("Received ACK=%u, Receiver Window=%d\n", ack_num, fc.receiver_window);
+                
+                // Check for zero window
+                if (fc.receiver_window == 0) {
+                    printf("Warning: Receiver window is zero - flow control will block sending\n");
+                }
                 
                 // Update RTT estimation
                 gettimeofday(&current_time, NULL);
@@ -169,11 +211,18 @@ void send_data(int sockfd, struct sockaddr_in *server_addr, socklen_t server_len
                        (uint32_t)(window[window_start].seq_num + window[window_start].data_length) <= ack_num) {
                     
                     printf("Packet SEQ=%u acknowledged\n", window[window_start].seq_num);
+                    
+                    // Update flow control
+                    fc.last_byte_acked = window[window_start].seq_num + window[window_start].data_length - 1;
+                    
                     window[window_start].is_valid = 0;
                     window_start = (window_start + 1) % WINDOW_SIZE;
                     window_count--;
                     base_seq_num = ack_num;
                 }
+                
+                printf("Flow control update: Bytes in flight = %d, Receiver window = %d\n", 
+                       fc.last_byte_sent - fc.last_byte_acked, fc.receiver_window);
             }
         } else if (select_result == 0) {
             // Timeout occurred, will be handled in next iteration
@@ -198,11 +247,16 @@ end_data_transfer:
             recvfrom(sockfd, &ack_header, sizeof(ack_header), 0, NULL, NULL);
             if (ack_header.flags & ACK) {
                 uint32_t ack_num = ntohl(ack_header.ack_num);
-                printf("Final ACK received: %u\n", ack_num);
+                uint16_t new_window = ntohs(ack_header.window_size);
+                fc.receiver_window = new_window;
+                
+                printf("Final ACK received: %u, Window: %d\n", ack_num, fc.receiver_window);
                 
                 // Slide window for final ACKs
                 while (window_count > 0 && window[window_start].is_valid && 
                        (uint32_t)(window[window_start].seq_num + window[window_start].data_length) <= ack_num) {
+                    
+                    fc.last_byte_acked = window[window_start].seq_num + window[window_start].data_length - 1;
                     window[window_start].is_valid = 0;
                     window_start = (window_start + 1) % WINDOW_SIZE;
                     window_count--;
@@ -283,8 +337,9 @@ int main() {
 
     recvfrom(sockfd, &header, BUFFER_SIZE, 0, (struct sockaddr *)&server_addr, &server_len);
     if ((header.flags & SYN) && (header.flags & ACK)) {
-        printf("Received SYN-ACK with seq_num: %u and ack_num: %u\n", 
-               ntohl(header.seq_num), ntohl(header.ack_num));
+        uint16_t initial_window = ntohs(header.window_size);
+        printf("Received SYN-ACK with seq_num: %u, ack_num: %u, window: %d\n", 
+               ntohl(header.seq_num), ntohl(header.ack_num), initial_window);
 
         struct sham_header final_ack_header;
         memset(&final_ack_header, 0, sizeof(final_ack_header));
