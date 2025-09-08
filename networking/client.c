@@ -4,19 +4,11 @@
 #include <unistd.h>
 #include "headers.h"
 #include <sys/socket.h>
+#include <arpa/inet.h>
 
 #define SERVER_IP "127.0.0.1"
 #define SERVER_PORT 8888
 #define BUFFER_SIZE sizeof(struct sham_header)
-#define PAYLOAD_SIZE 1024
-
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <unistd.h>
-#include "headers.h"
-#include <sys/socket.h>
-
 #define PAYLOAD_SIZE 1024
 
 void send_data(int sockfd, struct sockaddr_in *server_addr, socklen_t server_len) {
@@ -36,15 +28,35 @@ void send_data(int sockfd, struct sockaddr_in *server_addr, socklen_t server_len
             break;
         }
         
+        // Remove the newline character if it exists
+        size_t payload_len = strlen(payload);
+        if (payload_len > 0 && payload[payload_len - 1] == '\n') {
+            payload[payload_len - 1] = '\0';
+            payload_len--;
+        }
+        
+        // Skip empty messages
+        if (payload_len == 0) {
+            continue;
+        }
+        
         struct sham_packet packet;
+        // IMPORTANT: Initialize the entire packet structure
+        memset(&packet, 0, sizeof(packet));
+        
         packet.header.flags = 0; 
         packet.header.seq_num = htonl(seq_num);
-        memcpy(packet.payload, payload, strlen(payload));
+        packet.header.ack_num = htonl(0);
+        packet.header.window_size = htons(1024);
         
-        ssize_t bytes_to_send = sizeof(struct sham_header) + strlen(payload);
+        // Copy payload and ensure null termination
+        memcpy(packet.payload, payload, payload_len);
+        packet.payload[payload_len] = '\0';  // Null terminate
+        
+        ssize_t bytes_to_send = sizeof(struct sham_header) + payload_len + 1; // +1 for null terminator
         sendto(sockfd, &packet, bytes_to_send, 0, (const struct sockaddr *)server_addr, server_len);
-        printf("SND DATA SEQ=%u\n", seq_num);
-        seq_num += strlen(payload);
+        printf("SND DATA SEQ=%u, Length=%zu\n", seq_num, payload_len + 1);
+        seq_num += (payload_len + 1);
         
         struct sham_header ack_header;
         socklen_t temp_len = server_len;
@@ -57,10 +69,14 @@ void send_data(int sockfd, struct sockaddr_in *server_addr, socklen_t server_len
     // --- Termination logic starts here ---
     printf("Sending FIN to server...\n");
     struct sham_header fin_header;
+    // IMPORTANT: Initialize the entire header structure
+    memset(&fin_header, 0, sizeof(fin_header));
+    
     fin_header.flags = FIN;
-    // Set a meaningful sequence number for the FIN packet
     fin_header.seq_num = htonl(seq_num); 
     fin_header.ack_num = htonl(0);
+    fin_header.window_size = htons(1024);
+    
     sendto(sockfd, &fin_header, sizeof(fin_header), 0, (const struct sockaddr *)server_addr, server_len);
 
     // Step 2: Wait for ACK
@@ -77,9 +93,14 @@ void send_data(int sockfd, struct sockaddr_in *server_addr, socklen_t server_len
 
             // Step 4: Send final ACK
             struct sham_header final_ack_header;
+            // IMPORTANT: Initialize the entire header structure
+            memset(&final_ack_header, 0, sizeof(final_ack_header));
+            
             final_ack_header.flags = ACK;
             final_ack_header.seq_num = htonl(ntohl(header.ack_num));
             final_ack_header.ack_num = htonl(ntohl(header.seq_num) + 1);
+            final_ack_header.window_size = htons(1024);
+            
             sendto(sockfd, &final_ack_header, sizeof(final_ack_header), 0, (const struct sockaddr *)server_addr, server_len);
             printf("Connection closed.\n");
         }
@@ -103,8 +124,14 @@ int main() {
     inet_pton(AF_INET, SERVER_IP, &server_addr.sin_addr);
 
     // --- Handshake Step 1: Send SYN ---
+    // IMPORTANT: Initialize the entire header structure
+    memset(&header, 0, sizeof(header));
+    
     header.flags = SYN;
-    header.seq_num = htonl(50); // Client's initial sequence number X
+    header.seq_num = htonl(50);
+    header.ack_num = htonl(0);
+    header.window_size = htons(1024);
+    
     sendto(sockfd, &header, sizeof(header), 0, (const struct sockaddr *)&server_addr, server_len);
     printf("Sent SYN with seq_num: %u\n", ntohl(header.seq_num));
 
@@ -115,9 +142,13 @@ int main() {
 
         // --- Handshake Step 3: Send Final ACK ---
         struct sham_header final_ack_header;
+        // IMPORTANT: Initialize the entire header structure
+        memset(&final_ack_header, 0, sizeof(final_ack_header));
+        
         final_ack_header.flags = ACK;
         final_ack_header.seq_num = htonl(ntohl(header.ack_num));
         final_ack_header.ack_num = htonl(ntohl(header.seq_num) + 1);
+        final_ack_header.window_size = htons(1024);
 
         sendto(sockfd, &final_ack_header, sizeof(final_ack_header), 0, (const struct sockaddr *)&server_addr, server_len);
         printf("Sent final ACK. Handshake complete.\n");
@@ -126,7 +157,6 @@ int main() {
     }
 
     // --- Data Transfer Step ---
-    // The send_data function now handles both data transfer AND termination
     printf("Handshake complete. Starting data transfer.\n");
     send_data(sockfd, &server_addr, server_len);
     

@@ -57,7 +57,7 @@ void recv_data(int sockfd) {
             printf("RCV DATA SEQ=%u\n", expected_seq);
             
             // Print the received data to the console instead of writing to a file
-            printf("Received: %s", packet.payload);
+            printf("Received: %s\n", packet.payload);
             
             // Send cumulative ACK
             struct sham_header ack_header;
@@ -111,9 +111,13 @@ int main() {
 
         // --- Handshake Step 2: Send SYN-ACK ---
         struct sham_header syn_ack_header;
+        // IMPORTANT: Initialize the entire header structure
+        memset(&syn_ack_header, 0, sizeof(syn_ack_header));
+        
         syn_ack_header.flags = SYN | ACK;
         syn_ack_header.seq_num = htonl(100); // Server's initial sequence number Y
         syn_ack_header.ack_num = htonl(ntohl(header.seq_num) + 1); // Acknowledges client's seq_num X+1
+        syn_ack_header.window_size = htons(1024);
 
         sendto(sockfd, &syn_ack_header, sizeof(syn_ack_header), 0, (const struct sockaddr *)&client_addr, client_len);
         printf("Sent SYN-ACK with seq_num: %u and ack_num: %u\n", ntohl(syn_ack_header.seq_num), ntohl(syn_ack_header.ack_num));
