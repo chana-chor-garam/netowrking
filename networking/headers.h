@@ -10,6 +10,8 @@
 #include <arpa/inet.h>
 #include <sys/select.h>
 #include <sys/time.h>
+#include<sys/select.h>
+#include<math.h>
 
 // S.H.A.M. Header Structure
 struct sham_header {

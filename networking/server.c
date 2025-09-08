@@ -7,6 +7,15 @@
 
 #define SERVER_PORT 8888
 #define BUFFER_SIZE sizeof(struct sham_header)
+#define MAX_BUFFER_PACKETS 10
+
+// Structure to buffer out-of-order packets
+struct buffered_packet {
+    struct sham_packet packet;
+    int seq_num;
+    size_t data_length;
+    int is_valid;
+};
 
 void recv_data(int sockfd) {
     struct sockaddr_in client_addr;
@@ -14,10 +23,17 @@ void recv_data(int sockfd) {
     struct sham_packet packet;
     int expected_seq = 1;
     
+    // Buffer for out-of-order packets
+    struct buffered_packet buffer[MAX_BUFFER_PACKETS];
+    for (int i = 0; i < MAX_BUFFER_PACKETS; i++) {
+        buffer[i].is_valid = 0;
+    }
+    
     printf("Ready to receive data from the client...\n");
     
     while (1) {
-        ssize_t bytes_received = recvfrom(sockfd, &packet, sizeof(struct sham_packet), 0, (struct sockaddr *)&client_addr, &client_len);
+        ssize_t bytes_received = recvfrom(sockfd, &packet, sizeof(struct sham_packet), 0, 
+                                        (struct sockaddr *)&client_addr, &client_len);
         if (bytes_received < 0) {
             continue; // Keep waiting
         }
@@ -28,17 +44,23 @@ void recv_data(int sockfd) {
             
             // Step 1: Send ACK for client's FIN
             struct sham_header ack_header;
+            memset(&ack_header, 0, sizeof(ack_header));
+            
             ack_header.flags = ACK;
             ack_header.seq_num = htonl(expected_seq);
             ack_header.ack_num = htonl(ntohl(packet.header.seq_num) + 1);
+            ack_header.window_size = htons(1024);
             sendto(sockfd, &ack_header, sizeof(ack_header), 0, (const struct sockaddr *)&client_addr, client_len);
             printf("Sent ACK for client's FIN.\n");
             
             // Step 2: Send Server's own FIN
             struct sham_header fin_header;
+            memset(&fin_header, 0, sizeof(fin_header));
+            
             fin_header.flags = FIN;
             fin_header.seq_num = htonl(expected_seq);
             fin_header.ack_num = htonl(0);
+            fin_header.window_size = htons(1024);
             sendto(sockfd, &fin_header, sizeof(fin_header), 0, (const struct sockaddr *)&client_addr, client_len);
             printf("Sent server FIN. Waiting for final ACK.\n");
             
@@ -52,29 +74,94 @@ void recv_data(int sockfd) {
             break; // Exit the data receiving loop
         }
         
-        // Check for the expected sequence number
-        if (ntohl(packet.header.seq_num) == expected_seq) {
-            printf("RCV DATA SEQ=%u\n", expected_seq);
-            
-            // Print the received data to the console instead of writing to a file
+        int received_seq = ntohl(packet.header.seq_num);
+        size_t payload_length = bytes_received - sizeof(struct sham_header);
+        
+        // Ensure null termination for safety
+        if (payload_length > 0 && payload_length < sizeof(packet.payload)) {
+            packet.payload[payload_length] = '\0';
+        }
+        
+        printf("RCV DATA SEQ=%u, Expected=%u, Length=%zu\n", received_seq, expected_seq, payload_length);
+        
+        if (received_seq == expected_seq) {
+            // In-order packet - process it
             printf("Received: %s\n", packet.payload);
+            expected_seq += payload_length;
             
-            // Send cumulative ACK
-            struct sham_header ack_header;
-            ack_header.flags = ACK;
-            // The acknowledgment number is the next expected sequence number
-            ack_header.ack_num = htonl(expected_seq + (bytes_received - sizeof(struct sham_header)));
-            sendto(sockfd, &ack_header, sizeof(ack_header), 0, (const struct sockaddr *)&client_addr, client_len);
-            printf("RCV sends: ACK=%u\n", ntohl(ack_header.ack_num));
+            // Check if we can now process any buffered packets
+            int found_next = 1;
+            while (found_next) {
+                found_next = 0;
+                for (int i = 0; i < MAX_BUFFER_PACKETS; i++) {
+                    if (buffer[i].is_valid && buffer[i].seq_num == expected_seq) {
+                        printf("Processing buffered packet SEQ=%u\n", expected_seq);
+                        printf("Received: %s\n", buffer[i].packet.payload);
+                        expected_seq += buffer[i].data_length;
+                        buffer[i].is_valid = 0;
+                        found_next = 1;
+                        break;
+                    }
+                }
+            }
             
-            expected_seq += (bytes_received - sizeof(struct sham_header));
-        } else {
-            // Out-of-order or duplicate packet
-            printf("RCV DATA SEQ=%u (out of order). Resending ACK for %u\n", ntohl(packet.header.seq_num), expected_seq);
+            // Send cumulative ACK for all processed data
             struct sham_header ack_header;
+            memset(&ack_header, 0, sizeof(ack_header));
+            
             ack_header.flags = ACK;
+            ack_header.seq_num = htonl(expected_seq);
             ack_header.ack_num = htonl(expected_seq);
+            ack_header.window_size = htons(1024);
             sendto(sockfd, &ack_header, sizeof(ack_header), 0, (const struct sockaddr *)&client_addr, client_len);
+            printf("RCV sends: ACK=%u\n", expected_seq);
+            
+        } else if (received_seq > expected_seq) {
+            // Out-of-order packet (future packet) - buffer it
+            printf("Out-of-order packet SEQ=%u (expecting %u). Buffering.\n", received_seq, expected_seq);
+            
+            // Find empty slot in buffer
+            int buffered = 0;
+            for (int i = 0; i < MAX_BUFFER_PACKETS; i++) {
+                if (!buffer[i].is_valid) {
+                    buffer[i].packet = packet;
+                    buffer[i].seq_num = received_seq;
+                    buffer[i].data_length = payload_length;
+                    buffer[i].is_valid = 1;
+                    buffered = 1;
+                    printf("Packet buffered at slot %d\n", i);
+                    break;
+                }
+            }
+            
+            if (!buffered) {
+                printf("Warning: Buffer full, dropping packet SEQ=%u\n", received_seq);
+            }
+            
+            // Send ACK for the last contiguous sequence we have
+            struct sham_header ack_header;
+            memset(&ack_header, 0, sizeof(ack_header));
+            
+            ack_header.flags = ACK;
+            ack_header.seq_num = htonl(expected_seq);
+            ack_header.ack_num = htonl(expected_seq);
+            ack_header.window_size = htons(1024);
+            sendto(sockfd, &ack_header, sizeof(ack_header), 0, (const struct sockaddr *)&client_addr, client_len);
+            printf("RCV sends: ACK=%u (duplicate for missing data)\n", expected_seq);
+            
+        } else {
+            // Old/duplicate packet - just ACK it
+            printf("Duplicate/old packet SEQ=%u (expecting %u). Sending ACK.\n", received_seq, expected_seq);
+            
+            struct sham_header ack_header;
+            memset(&ack_header, 0, sizeof(ack_header));
+            
+            ack_header.flags = ACK;
+            ack_header.seq_num = htonl(expected_seq);
+            ack_header.ack_num = htonl(expected_seq);
+            ack_header.window_size = htons(1024);
+            sendto(sockfd, &ack_header, sizeof(ack_header), 0, (const struct sockaddr *)&client_addr, client_len);
+            printf("RCV sends: ACK=%u\n", expected_seq);
         }
     }
 }
@@ -111,12 +198,11 @@ int main() {
 
         // --- Handshake Step 2: Send SYN-ACK ---
         struct sham_header syn_ack_header;
-        // IMPORTANT: Initialize the entire header structure
         memset(&syn_ack_header, 0, sizeof(syn_ack_header));
         
         syn_ack_header.flags = SYN | ACK;
-        syn_ack_header.seq_num = htonl(100); // Server's initial sequence number Y
-        syn_ack_header.ack_num = htonl(ntohl(header.seq_num) + 1); // Acknowledges client's seq_num X+1
+        syn_ack_header.seq_num = htonl(100);
+        syn_ack_header.ack_num = htonl(ntohl(header.seq_num) + 1);
         syn_ack_header.window_size = htons(1024);
 
         sendto(sockfd, &syn_ack_header, sizeof(syn_ack_header), 0, (const struct sockaddr *)&client_addr, client_len);
@@ -135,9 +221,7 @@ int main() {
 
     // --- Data Transfer Step ---
     printf("Handshake complete. Starting data transfer.\n");
-    recv_data(sockfd); // This function now handles the complete termination
-
-    // REMOVED: The duplicate FIN handling code that was causing the problem
+    recv_data(sockfd);
     
     printf("Server shutting down.\n");
     close(sockfd);
