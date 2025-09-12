@@ -9,6 +9,7 @@
 #include <sys/select.h>
 #include <openssl/md5.h> // Include for MD5 functions
 #include <stdarg.h>
+#include <openssl/evp.h> // Use EVP API for modern cryptographic operations
 
 #define MAX_BUFFER_PACKETS 10
 #define RECEIVER_BUFFER_SIZE 8192
@@ -36,10 +37,11 @@ void print_usage(const char* program_name);
 void send_ack(int sockfd, struct sockaddr_in *client_addr, socklen_t client_len, int ack_num, int window_size);
 void calculate_md5_hash(const char* filename);
 void log_message(const char *format, ...);
+void send_termination_sequence(int sockfd, struct sockaddr_in *client_addr, socklen_t client_len, int next_seq_num, int available_window);
 
 // Function to log messages with high-precision timestamps
 void log_message(const char *format, ...) {
-    if (!log_file) return;
+    if (!log_file) return; // Ensure logging is active only when log_file is open
 
     struct timeval tv;
     gettimeofday(&tv, NULL);
@@ -53,38 +55,63 @@ void log_message(const char *format, ...) {
     va_start(args, format);
     vfprintf(log_file, format, args);
     va_end(args);
-    
+
     fflush(log_file);
 }
 
 // Function to calculate and print the MD5 hash of a file
 void calculate_md5_hash(const char* filename) {
-    unsigned char c[MD5_DIGEST_LENGTH];
-    int i;
+    unsigned char md_value[EVP_MAX_MD_SIZE];
+    unsigned int md_len;
     FILE *inFile = fopen(filename, "rb");
-    MD5_CTX mdContext;
-    int bytes;
-    unsigned char data[1024];
-
-    if (inFile == NULL) {
+    if (!inFile) {
         perror("Failed to open file for MD5 calculation");
         return;
     }
 
-    MD5_Init(&mdContext);
-    while ((bytes = fread(data, 1, 1024, inFile)) != 0) {
-        MD5_Update(&mdContext, data, bytes);
+    EVP_MD_CTX *mdctx = EVP_MD_CTX_new();
+    if (!mdctx) {
+        perror("Failed to create EVP_MD_CTX");
+        fclose(inFile);
+        return;
     }
-    MD5_Final(c, &mdContext);
-    
+
+    if (EVP_DigestInit_ex(mdctx, EVP_md5(), NULL) != 1) {
+        perror("Failed to initialize MD5 digest");
+        EVP_MD_CTX_free(mdctx);
+        fclose(inFile);
+        return;
+    }
+
+    unsigned char data[1024];
+    int bytes;
+    while ((bytes = fread(data, 1, sizeof(data), inFile)) != 0) {
+        if (EVP_DigestUpdate(mdctx, data, bytes) != 1) {
+            perror("Failed to update MD5 digest");
+            EVP_MD_CTX_free(mdctx);
+            fclose(inFile);
+            return;
+        }
+    }
+
+    if (EVP_DigestFinal_ex(mdctx, md_value, &md_len) != 1) {
+        perror("Failed to finalize MD5 digest");
+        EVP_MD_CTX_free(mdctx);
+        fclose(inFile);
+        return;
+    }
+
+    EVP_MD_CTX_free(mdctx);
+    fclose(inFile);
+
     printf("MD5: ");
-    for (i = 0; i < MD5_DIGEST_LENGTH; i++) {
-        printf("%02x", c[i]);
+    for (unsigned int i = 0; i < md_len; i++) {
+        printf("%02x", md_value[i]);
     }
     printf("\n");
-    fclose(inFile);
 }
 
+// Simulate packet loss
 int should_drop_packet() {
     if (packet_loss_rate <= 0.0) return 0;
     double random_val = (double)rand() / RAND_MAX;
@@ -99,7 +126,7 @@ void send_ack(int sockfd, struct sockaddr_in *client_addr, socklen_t client_len,
     ack_header.window_size = htons(window_size);
     if (!should_drop_packet()) {
         sendto(sockfd, &ack_header, sizeof(ack_header), 0, (const struct sockaddr *)client_addr, client_len);
-        printf("RCV sends: ACK=%u, Window=%d\n", ack_num, window_size);
+        printf("SND ACK=%u, Window=%d\n", ack_num, window_size);
         log_message("SND ACK=%u WIN=%d\n", ack_num, window_size);
     } else {
         printf("DROPPED ACK=%u (simulated loss)\n", ack_num);
@@ -107,152 +134,107 @@ void send_ack(int sockfd, struct sockaddr_in *client_addr, socklen_t client_len,
     }
 }
 
+void send_termination_sequence(int sockfd, struct sockaddr_in *client_addr, socklen_t client_len, int next_seq_num, int available_window) {
+    printf("Sending server FIN. Waiting for final ACK.\n");
+    log_message("SND FIN SEQ=%u\n", next_seq_num);
+    struct sham_header fin_header;
+    memset(&fin_header, 0, sizeof(fin_header));
+    fin_header.flags = FIN;
+    fin_header.seq_num = htonl(next_seq_num);
+    fin_header.ack_num = htonl(0);
+    fin_header.window_size = htons(available_window);
+    
+    int retries = 0;
+    while (retries < 5) {
+        if (!should_drop_packet()) {
+            sendto(sockfd, &fin_header, sizeof(fin_header), 0, (const struct sockaddr *)client_addr, client_len);
+        } else {
+            printf("DROPPED server FIN (simulated loss)\n");
+            log_message("DROP FIN\n");
+        }
+        
+        struct timeval tv = {1, 0};
+        fd_set read_fds;
+        FD_ZERO(&read_fds);
+        FD_SET(sockfd, &read_fds);
+        
+        int select_result = select(sockfd + 1, &read_fds, NULL, NULL, &tv);
+        if (select_result > 0) {
+            struct sham_header final_ack;
+            ssize_t bytes_received = recvfrom(sockfd, &final_ack, sizeof(final_ack), 0, NULL, NULL);
+            if (bytes_received > 0 && final_ack.flags & ACK) {
+                printf("Received final ACK. Connection closed gracefully.\n");
+                log_message("RCV ACK\n");
+                return; // Exit the function on success
+            }
+        }
+        printf("Timeout waiting for final ACK. Retransmitting FIN...\n");
+        log_message("TIMEOUT RETX FIN\n");
+        retries++;
+    }
+    printf("Failed to receive final ACK. Connection may not have closed gracefully.\n");
+    log_message("FINAL ACK TIMEOUT\n");
+}
+
 void recv_data_chat(int sockfd) {
     struct sockaddr_in client_addr;
     socklen_t client_len = sizeof(client_addr);
     struct sham_packet packet;
     int expected_seq = 1;
-    
+
     struct buffered_packet buffer[MAX_BUFFER_PACKETS];
     for (int i = 0; i < MAX_BUFFER_PACKETS; i++) {
         buffer[i].is_valid = 0;
     }
-    
+
     struct flow_control fc;
     fc.buffer_used = 0;
     fc.buffer_available = RECEIVER_BUFFER_SIZE;
-    
+
     printf("Ready to receive chat messages from the client...\n");
     printf("Receiver buffer size: %d bytes\n", RECEIVER_BUFFER_SIZE);
     if (packet_loss_rate > 0.0) {
         printf("Packet loss rate: %.2f%%\n", packet_loss_rate * 100);
     }
-    
+
     while (1) {
         ssize_t bytes_received = recvfrom(sockfd, &packet, sizeof(struct sham_packet), 0, (struct sockaddr *)&client_addr, &client_len);
         if (bytes_received < 0) {
             continue;
         }
-        
+
         if (should_drop_packet()) {
             printf("DROPPED packet SEQ=%u (simulated loss)\n", ntohl(packet.header.seq_num));
             log_message("DROP DATA SEQ=%u\n", ntohl(packet.header.seq_num));
             continue;
         }
-        
+
         if (packet.header.flags & FIN) {
             printf("Received FIN from client. Starting connection termination.\n");
             log_message("RCV FIN SEQ=%u\n", ntohl(packet.header.seq_num));
-            send_ack(sockfd, &client_addr, client_len, ntohl(packet.header.seq_num) + 1, fc.buffer_available);
+            int next_seq_num = ntohl(packet.header.seq_num) + 1;
+            send_ack(sockfd, &client_addr, client_len, next_seq_num, fc.buffer_available);
             log_message("SND ACK FOR FIN\n");
-            
-            struct sham_header fin_header;
-            memset(&fin_header, 0, sizeof(fin_header));
-            fin_header.flags = FIN;
-            fin_header.seq_num = htonl(expected_seq);
-            fin_header.ack_num = htonl(0);
-            fin_header.window_size = htons(fc.buffer_available);
-            
-            int retries = 0;
-            while (retries < 5) {
-                if (!should_drop_packet()) {
-                    sendto(sockfd, &fin_header, sizeof(fin_header), 0, (const struct sockaddr *)&client_addr, client_len);
-                    printf("Sent server FIN. Waiting for final ACK.\n");
-                    log_message("SND FIN SEQ=%u\n", expected_seq);
-                }
-                
-                struct timeval tv = {1, 0};
-                fd_set read_fds;
-                FD_ZERO(&read_fds);
-                FD_SET(sockfd, &read_fds);
-                
-                int select_result = select(sockfd + 1, &read_fds, NULL, NULL, &tv);
-                if (select_result > 0) {
-                    struct sham_header final_ack;
-                    recvfrom(sockfd, &final_ack, sizeof(final_ack), 0, (struct sockaddr *)&client_addr, &client_len);
-                    if (final_ack.flags & ACK) {
-                        printf("Received final ACK. Connection closed gracefully.\n");
-                        log_message("RCV ACK\n");
-                        goto end_loop;
-                    }
-                }
-                retries++;
-            }
-            printf("Failed to receive final ACK. Connection may not have closed gracefully.\n");
-            log_message("FINAL ACK TIMEOUT\n");
-
-end_loop:
+            send_termination_sequence(sockfd, &client_addr, client_len, next_seq_num, fc.buffer_available);
             break;
         }
-        
+
         int received_seq = ntohl(packet.header.seq_num);
         size_t payload_length = bytes_received - sizeof(struct sham_header);
         if (payload_length > 0 && payload_length < sizeof(packet.payload)) {
             packet.payload[payload_length] = '\0';
         }
-        
+
         printf("RCV DATA SEQ=%u, Expected=%u, Length=%zu, Buffer Used=%d, Available=%d\n", received_seq, expected_seq, payload_length, fc.buffer_used, fc.buffer_available);
         log_message("RCV DATA SEQ=%u LEN=%zu\n", received_seq, payload_length);
 
         if (received_seq == expected_seq) {
             printf("Client: %s\n", packet.payload);
             expected_seq += payload_length;
-            
-            int found_next;
-            do {
-                found_next = 0;
-                for (int i = 0; i < MAX_BUFFER_PACKETS; i++) {
-                    if (buffer[i].is_valid && buffer[i].seq_num == expected_seq) {
-                        printf("Processing buffered packet SEQ=%u\n", expected_seq);
-                        printf("Client: %s\n", buffer[i].packet.payload);
-                        fc.buffer_used -= buffer[i].data_length;
-                        fc.buffer_available += buffer[i].data_length;
-                        
-                        expected_seq += buffer[i].data_length;
-                        buffer[i].is_valid = 0;
-                        found_next = 1;
-                        break;
-                    }
-                }
-            } while (found_next);
-            
+
             send_ack(sockfd, &client_addr, client_len, expected_seq, fc.buffer_available);
         } else if (received_seq > expected_seq) {
-            printf("Out-of-order packet SEQ=%u (expecting %u). ", received_seq, expected_seq);
-            
-            int already_buffered = 0;
-            for(int i = 0; i < MAX_BUFFER_PACKETS; i++) {
-                if(buffer[i].is_valid && buffer[i].seq_num == received_seq) {
-                    already_buffered = 1;
-                    break;
-                }
-            }
-
-            if (!already_buffered && fc.buffer_available >= (int)payload_length) {
-                int buffered = 0;
-                for (int i = 0; i < MAX_BUFFER_PACKETS; i++) {
-                    if (!buffer[i].is_valid) {
-                        buffer[i].packet = packet;
-                        buffer[i].seq_num = received_seq;
-                        buffer[i].data_length = payload_length;
-                        buffer[i].is_valid = 1;
-                        fc.buffer_used += payload_length;
-                        fc.buffer_available -= payload_length;
-                        buffered = 1;
-                        printf("Buffering at slot %d\n", i);
-                        break;
-                    }
-                }
-                if (!buffered) {
-                    printf("Warning: Buffer slots full, dropping packet SEQ=%u\n", received_seq);
-                }
-            } else {
-                 if (already_buffered) {
-                     printf("Packet already buffered.\n");
-                 } else {
-                     printf("Insufficient buffer space (%d bytes needed, %d available), dropping packet\n", (int)payload_length, fc.buffer_available);
-                 }
-            }
+            printf("Out-of-order packet SEQ=%u (expecting %u). Sending ACK.\n", received_seq, expected_seq);
             send_ack(sockfd, &client_addr, client_len, expected_seq, fc.buffer_available);
         } else {
             printf("Duplicate/old packet SEQ=%u (expecting %u). Sending ACK.\n", received_seq, expected_seq);
@@ -330,44 +312,7 @@ void recv_data_file(int sockfd, const char* output_filename) {
             calculate_md5_hash(output_filename); // Call the MD5 function here
 
             send_ack(sockfd, &client_addr, client_len, ntohl(packet.header.seq_num) + 1, fc.buffer_available);
-            log_message("SND ACK FOR FIN\n");
-            
-            struct sham_header fin_header;
-            memset(&fin_header, 0, sizeof(fin_header));
-            fin_header.flags = FIN;
-            fin_header.seq_num = htonl(expected_seq);
-            fin_header.ack_num = htonl(0);
-            fin_header.window_size = htons(fc.buffer_available);
-            
-            int retries = 0;
-            while (retries < 5) {
-                 if (!should_drop_packet()) {
-                    sendto(sockfd, &fin_header, sizeof(fin_header), 0, (const struct sockaddr *)&client_addr, client_len);
-                    printf("Sent server FIN. Waiting for final ACK.\n");
-                    log_message("SND FIN SEQ=%u\n", expected_seq);
-                }
-                
-                struct timeval tv = {1, 0};
-                fd_set read_fds;
-                FD_ZERO(&read_fds);
-                FD_SET(sockfd, &read_fds);
-                
-                int select_result = select(sockfd + 1, &read_fds, NULL, NULL, &tv);
-                if (select_result > 0) {
-                    struct sham_header final_ack;
-                    recvfrom(sockfd, &final_ack, sizeof(final_ack), 0, (struct sockaddr *)&client_addr, &client_len);
-                    if (final_ack.flags & ACK) {
-                        printf("Received final ACK. Connection closed gracefully.\n");
-                        log_message("RCV ACK\n");
-                        goto end_loop;
-                    }
-                }
-                retries++;
-            }
-            printf("Failed to receive final ACK. Connection may not have closed gracefully.\n");
-            log_message("FINAL ACK TIMEOUT\n");
-            
-end_loop:
+            send_termination_sequence(sockfd, &client_addr, client_len, expected_seq, fc.buffer_available);
             break;
         }
         
@@ -531,7 +476,7 @@ int main(int argc, char *argv[]) {
         syn_ack_header.window_size = htons(RECEIVER_BUFFER_SIZE);
         if (!should_drop_packet()) {
             sendto(sockfd, &syn_ack_header, sizeof(syn_ack_header), 0, (const struct sockaddr *)&client_addr, client_len);
-            printf("Sent SYN-ACK with seq_num: %u, ack_num: %u, window: %d\n", ntohl(syn_ack_header.seq_num), ntohl(syn_ack_header.ack_num), RECEIVER_BUFFER_SIZE);
+            printf("SND SYN-ACK SEQ=%u ACK=%u\n", ntohl(syn_ack_header.seq_num), ntohl(syn_ack_header.ack_num));
             log_message("SND SYN-ACK SEQ=%u ACK=%u\n", ntohl(syn_ack_header.seq_num), ntohl(syn_ack_header.ack_num));
         } else {
             printf("DROPPED SYN-ACK (simulated loss)\n");

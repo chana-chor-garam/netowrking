@@ -52,7 +52,7 @@ void log_message(const char *format, ...);
 
 // Function to log messages with high-precision timestamps
 void log_message(const char *format, ...) {
-    if (!log_file) return;
+    if (!log_file) return; // Ensure logging is active only when log_file is open
 
     struct timeval tv;
     gettimeofday(&tv, NULL);
@@ -66,7 +66,7 @@ void log_message(const char *format, ...) {
     va_start(args, format);
     vfprintf(log_file, format, args);
     va_end(args);
-    
+
     fflush(log_file);
 }
 
@@ -83,31 +83,31 @@ void send_data_chat(int sockfd, struct sockaddr_in *server_addr, socklen_t serve
     struct sent_packet window[WINDOW_SIZE];
     int window_start = 0;
     int window_count = 0;
-    
+
     struct flow_control fc;
     fc.last_byte_sent = 0;
     fc.last_byte_acked = 0;
     fc.receiver_window = 1024;
-    
+
     for (int i = 0; i < WINDOW_SIZE; i++) {
         window[i].is_valid = 0;
     }
-    
+
     printf("Enter chat messages (type '/quit' to exit):\n");
     if (packet_loss_rate > 0.0) {
         printf("Packet loss rate: %.2f%%\n", packet_loss_rate * 100);
     }
-    
+
     while (1) {
         // Step 1: Check for incoming ACKs and timeouts
         fd_set read_fds;
         struct timeval tv, current_time;
-        
+
         if (window_count > 0) {
             gettimeofday(&current_time, NULL);
             double elapsed = (current_time.tv_sec - window[window_start].sent_time.tv_sec) * 1000.0 +
                              (current_time.tv_usec - window[window_start].sent_time.tv_usec) / 1000.0;
-            
+
             if (elapsed >= RTO) {
                 printf("TIMEOUT! Retransmitting SEQ=%u\n", window[window_start].seq_num);
                 log_message("TIMEOUT SEQ=%u\n", window[window_start].seq_num);
@@ -130,37 +130,37 @@ void send_data_chat(int sockfd, struct sockaddr_in *server_addr, socklen_t serve
             tv.tv_sec = 1;
             tv.tv_usec = 0;
         }
-        
+
         FD_ZERO(&read_fds);
         FD_SET(sockfd, &read_fds);
-        
+
         int select_result = select(sockfd + 1, &read_fds, NULL, NULL, &tv);
 
         if (select_result > 0) {
             struct sham_header ack_header;
             recvfrom(sockfd, &ack_header, sizeof(ack_header), 0, NULL, NULL);
-            
+
             if (ack_header.flags & ACK) {
                 uint32_t ack_num = ntohl(ack_header.ack_num);
                 fc.receiver_window = ntohs(ack_header.window_size);
-                
+
                 printf("Received ACK=%u, Receiver Window=%d\n", ack_num, fc.receiver_window);
                 log_message("RCV ACK=%u\n", ack_num);
-                
+
                 // Update RTT/RTO only for non-retransmitted packets
                 if (window_count > 0 && window[window_start].is_valid) {
-                     gettimeofday(&current_time, NULL);
-                     double SampleRTT = (current_time.tv_sec - window[window_start].sent_time.tv_sec) * 1000.0 + 
+                    gettimeofday(&current_time, NULL);
+                    double SampleRTT = (current_time.tv_sec - window[window_start].sent_time.tv_sec) * 1000.0 +
                                        (current_time.tv_usec - window[window_start].sent_time.tv_usec) / 1000.0;
-                     
-                     EstimatedRTT = (1 - ALPHA) * EstimatedRTT + ALPHA * SampleRTT;
-                     DevRTT = (1 - BETA) * DevRTT + BETA * fabs(SampleRTT - EstimatedRTT);
-                     RTO = EstimatedRTT + 4 * DevRTT;
-                     
-                     if (RTO < 100) RTO = 100;
-                     if (RTO > 5000) RTO = 5000;
+
+                    EstimatedRTT = (1 - ALPHA) * EstimatedRTT + ALPHA * SampleRTT;
+                    DevRTT = (1 - BETA) * DevRTT + BETA * fabs(SampleRTT - EstimatedRTT);
+                    RTO = EstimatedRTT + 4 * DevRTT;
+
+                    if (RTO < 100) RTO = 100;
+                    if (RTO > 5000) RTO = 5000;
                 }
-                
+
                 // Slide the window
                 while (window_count > 0 && (uint32_t)(window[window_start].seq_num + window[window_start].data_length) <= ack_num) {
                     printf("Packet SEQ=%u acknowledged\n", window[window_start].seq_num);
@@ -169,7 +169,7 @@ void send_data_chat(int sockfd, struct sockaddr_in *server_addr, socklen_t serve
                     window_start = (window_start + 1) % WINDOW_SIZE;
                     window_count--;
                 }
-                
+
                 printf("Flow control update: Bytes in flight = %d, Receiver window = %d\n", fc.last_byte_sent - fc.last_byte_acked, fc.receiver_window);
                 log_message("FLOW WIN UPDATE=%u\n", fc.receiver_window);
             }
@@ -184,37 +184,37 @@ void send_data_chat(int sockfd, struct sockaddr_in *server_addr, socklen_t serve
             char payload[PAYLOAD_SIZE];
             printf("You: ");
             fflush(stdout);
-            
+
             if (fgets(payload, PAYLOAD_SIZE, stdin) == NULL) {
                 goto end_data_transfer;
             }
             if (strcmp(payload, "/quit\n") == 0) {
                 goto end_data_transfer;
             }
-            
+
             size_t payload_len = strlen(payload);
-            if (payload_len > 0 && payload[payload_len-1] == '\n') {
-                payload[payload_len-1] = '\0';
+            if (payload_len > 0 && payload[payload_len - 1] == '\n') {
+                payload[payload_len - 1] = '\0';
                 payload_len--;
             }
             if (payload_len == 0) continue;
-            
+
             size_t packet_data_len = payload_len + 1;
             int slot = (window_start + window_count) % WINDOW_SIZE;
-            
+
             memset(&window[slot], 0, sizeof(struct sent_packet));
             window[slot].is_valid = 1;
             window[slot].seq_num = next_seq_num;
             window[slot].data_length = packet_data_len;
-            
+
             window[slot].packet.header.flags = 0;
             window[slot].packet.header.seq_num = htonl(next_seq_num);
             window[slot].packet.header.ack_num = htonl(0);
             window[slot].packet.header.window_size = htons(1024);
-            
+
             memcpy(window[slot].packet.payload, payload, payload_len);
             window[slot].packet.payload[payload_len] = '\0';
-            
+
             ssize_t bytes_to_send = sizeof(struct sham_header) + packet_data_len;
             if (!should_drop_packet()) {
                 sendto(sockfd, &window[slot].packet, bytes_to_send, 0, (const struct sockaddr *)server_addr, server_len);
@@ -226,18 +226,18 @@ void send_data_chat(int sockfd, struct sockaddr_in *server_addr, socklen_t serve
                 log_message("DROP DATA SEQ=%u\n", next_seq_num);
                 gettimeofday(&window[slot].sent_time, NULL);
             }
-            
+
             fc.last_byte_sent = next_seq_num + packet_data_len - 1;
             next_seq_num += packet_data_len;
             window_count++;
             bytes_in_flight = fc.last_byte_sent - fc.last_byte_acked;
         }
-        
+
         if (window_count == 0 && next_seq_num > 1) {
             break; // All data sent and acknowledged
         }
     }
-    
+
 end_data_transfer:
     send_termination_sequence(sockfd, server_addr, server_len, next_seq_num);
 }
@@ -426,17 +426,17 @@ void send_termination_sequence(int sockfd, struct sockaddr_in *server_addr, sock
         int select_result = select(sockfd + 1, &read_fds, NULL, NULL, &tv);
         if (select_result > 0) {
             recvfrom(sockfd, &header, sizeof(header), 0, (struct sockaddr *)server_addr, &temp_len);
-            if (header.flags & ACK && header.flags & FIN) {
+            if (header.flags & FIN && header.flags & ACK) {
                 printf("Received FIN-ACK from server. Sending final ACK.\n");
                 log_message("RCV FIN-ACK SEQ=%u ACK=%u\n", ntohl(header.seq_num), ntohl(header.ack_num));
+                goto send_final_ack;
+            } else if (header.flags & FIN) {
+                printf("Received FIN from server. Sending final ACK.\n");
+                log_message("RCV FIN SEQ=%u\n", ntohl(header.seq_num));
                 goto send_final_ack;
             } else if (header.flags & ACK) {
                 printf("Received ACK from server. Waiting for their FIN.\n");
                 log_message("RCV ACK FOR FIN\n");
-            } else if (header.flags & FIN) {
-                printf("Received FIN from server. Sending final ACK.\n");
-                log_message("RCV FIN\n");
-                goto send_final_ack;
             }
         } else {
             printf("Timeout waiting for server response. Re-transmitting FIN...\n");
